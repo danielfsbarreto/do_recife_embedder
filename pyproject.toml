@@ -1,0 +1,26 @@
+[project]
+name = "do_recife_embedder"
+version = "0.1.0"
+description = "do_recife_embedder using crewAI"
+authors = [{ name = "Your Name", email = "you@example.com" }]
+requires-python = ">=3.10,<3.14"
+dependencies = [
+    "crewai[tools]==1.14.6",
+    "semchunk>=4.0.0",
+    "pymongo>=4.17",
+    "pymupdf>=1.26.6",
+    "tiktoken==0.12.0",
+]
+
+[project.scripts]
+kickoff = "do_recife_embedder.main:kickoff"
+run_crew = "do_recife_embedder.main:kickoff"
+plot = "do_recife_embedder.main:plot"
+run_with_trigger = "do_recife_embedder.main:run_with_trigger"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.crewai]
+type = "flow"
