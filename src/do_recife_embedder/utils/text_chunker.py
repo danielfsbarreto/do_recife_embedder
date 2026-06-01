@@ -11,7 +11,7 @@ class TextChunker:
     ``text-embedding-3-large`` embedding model.
     """
 
-    def __init__(self, chunk_size: int = 256, overlap: float = 0.2):
+    def __init__(self, chunk_size: int = 512, overlap: float = 0.2):
         self.chunk_size = chunk_size
         self.overlap = overlap
         self._encoding = tiktoken.encoding_for_model(_EMBEDDING_MODEL)
