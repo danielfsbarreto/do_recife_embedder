@@ -7,8 +7,9 @@ _EMBEDDING_MODEL = "text-embedding-3-large"
 class TextChunker:
     """Semantic chunking via ``semchunk`` with a tiktoken token counter.
 
-    Defaults to 256-token chunks with 20% overlap, sized for the
-    ``text-embedding-3-large`` embedding model.
+    Defaults to 512-token chunks with 20% overlap, sized for the
+    ``text-embedding-3-large`` embedding model. Callers can override
+    ``chunk_size``/``overlap`` to tune chunking per use case.
     """
 
     def __init__(self, chunk_size: int = 512, overlap: float = 0.2):

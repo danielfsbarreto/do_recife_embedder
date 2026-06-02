@@ -54,11 +54,28 @@ _WHITESPACE_RE = re.compile(r"\s+")
 
 # --- Storage targets (hardcoded on purpose for this training project) --------
 # We write to TWO collections to compare retrieval quality with and without
-# metadata. Both get the SAME text and the SAME vector; only the stored shape
-# differs.
+# metadata. Each collection now carries its OWN chunking configuration, so the
+# stored text differs as well: the enriched collection keeps larger, overlapping
+# passages while the plain collection uses smaller, non-overlapping ones. Because
+# the chunks differ, each collection is chunked and embedded independently (the
+# vectors can no longer be shared between them).
 _DATABASE_NAME = "do-recife"
-_COLLECTION_PLAIN = "do-recife-rag"  # without metadata: {_id, text, embedding}
-_COLLECTION_ENRICHED = "do-recife-rag-enriched"  # adds a rich `metadata` object
+_COLLECTION_CONFIGS = {
+    # plain: {_id, text, embedding} only — small, non-overlapping chunks.
+    "plain": {
+        "name": "do-recife-rag",
+        "chunk_size": 128,
+        "overlap": 0.0,
+        "enriched": False,
+    },
+    # enriched: adds a rich `metadata` object — larger, overlapping chunks.
+    "enriched": {
+        "name": "do-recife-rag-enriched",
+        "chunk_size": 512,
+        "overlap": 0.2,
+        "enriched": True,
+    },
+}
 
 # --- Concurrency -------------------------------------------------------------
 # How many PDFs to embed at the same time. The per-file work is I/O-bound (it
@@ -67,7 +84,7 @@ _COLLECTION_ENRICHED = "do-recife-rag-enriched"  # adds a rich `metadata` object
 # whole run up. A bounded thread pool of this size acts as our semaphore: never
 # more than _MAX_PARALLEL_FILES files run concurrently. Tune it to taste and to
 # your OpenAI rate limits.
-_MAX_PARALLEL_FILES = 5
+_MAX_PARALLEL_FILES = 10
 
 
 class PdfEmbeddingService:
@@ -121,10 +138,26 @@ class PdfEmbeddingService:
         # actually connect until the first real operation.
         self._mongo_client = MongoClient(connection_string)
         self._db = self._mongo_client[_DATABASE_NAME]
-        self._plain = self._db[_COLLECTION_PLAIN]  # handle to the plain collection
-        self._enriched = self._db[_COLLECTION_ENRICHED]  # handle to the enriched one
         self._openai_client = OpenAI(api_key=openai_api_key)
-        self._chunker = TextChunker()
+
+        # Build one entry per collection from the config: each carries its own
+        # MongoDB handle, its own TextChunker (sized per the config), and whether
+        # it stores the rich `metadata` block. Because the chunkers differ, the
+        # two collections no longer share text or embeddings.
+        self._collections = {
+            key: {
+                "handle": self._db[cfg["name"]],
+                "chunker": TextChunker(
+                    chunk_size=cfg["chunk_size"], overlap=cfg["overlap"]
+                ),
+                "enriched": cfg["enriched"],
+            }
+            for key, cfg in _COLLECTION_CONFIGS.items()
+        }
+        # Convenience refs for the metadata-specific logic below (idempotency,
+        # stale cleanup) that must target the enriched collection specifically.
+        self._plain = self._collections["plain"]["handle"]
+        self._enriched = self._collections["enriched"]["handle"]
 
     def call(self) -> dict:
         """Entry point: prepare storage, then process every PDF in the data dir."""
@@ -249,113 +282,139 @@ class PdfEmbeddingService:
         total_pages: int,
         do_issue: DoIssue,
     ) -> None:
-        """Chunk, embed, and store a single page (the core of the pipeline)."""
+        """Chunk, embed, and store a single page (the core of the pipeline).
+
+        Each collection is processed independently because they now use different
+        chunking (size/overlap). That means the page is chunked once per
+        collection and, when a collection is missing/incomplete for this page,
+        embedded once per collection (the vectors can no longer be shared).
+        """
         # Normalize whitespace so the page "fingerprint" is stable. If the page is
         # blank (e.g. a scanned image with no text layer), there is nothing to do.
         normalized = _WHITESPACE_RE.sub(" ", page_text).strip()
         if not normalized:
             return  # blank page, nothing to embed
 
-        # Split the page into token-sized passages. Each chunk becomes one stored
-        # document with its own embedding.
-        chunks = self._chunker.chunk_text(page_text)
-        if not chunks:
-            return
-
         # `page_hash` uniquely identifies "this page content of this file version".
-        # `expected` is how many chunks this page should produce.
+        # It is independent of chunking, so it is shared across collections and is
+        # the stable key used for per-page idempotency below.
         page_hash = self._page_hash(file_md5, page_number, normalized)
-        expected = len(chunks)
 
-        # IDEMPOTENCY (per page): count what's already stored for this page in each
-        # collection. We identify a page's documents two ways:
-        #   - enriched: by the metadata.page_hash field
-        #   - plain: by the deterministic _id prefix "page_hash:" (no metadata there)
-        enriched_existing = self._enriched.count_documents(
-            {"metadata.page_hash": page_hash}
-        )
-        plain_existing = self._plain.count_documents(
-            {"_id": {"$regex": f"^{re.escape(page_hash)}:"}}
-        )
+        for entry in self._collections.values():
+            # Split the page using THIS collection's chunker. Each chunk becomes
+            # one stored document with its own embedding.
+            chunks = entry["chunker"].chunk_text(page_text)
+            if not chunks:
+                continue
+            expected = len(chunks)
+            handle = entry["handle"]
 
-        # A collection is "ok" for this page when it already has exactly the number
-        # of chunks we expect. If BOTH are complete, skip (no embedding cost).
-        enriched_ok = enriched_existing == expected
-        plain_ok = plain_existing == expected
-        if enriched_ok and plain_ok:
-            return  # page already fully embedded in both collections
+            # IDEMPOTENCY (per page, per collection): how many chunks for this page
+            # are already stored here? We identify a page's documents two ways:
+            #   - enriched: by the metadata.page_hash field
+            #   - plain: by the deterministic _id prefix "page_hash:" (no metadata)
+            if entry["enriched"]:
+                page_filter = {"metadata.page_hash": page_hash}
+            else:
+                page_filter = {"_id": {"$regex": f"^{re.escape(page_hash)}:"}}
+            existing = handle.count_documents(page_filter)
 
-        # We only reach the (paid) embedding call when at least one collection is
-        # missing/incomplete for this page. We embed ONCE and reuse the vectors
-        # for both collections so their embeddings are guaranteed identical.
-        embeddings = self._embed_texts(chunks)
+            # Already complete for this page in this collection — nothing to do.
+            if existing == expected:
+                continue
 
-        # --- Write to the ENRICHED collection (text + embedding + metadata) ------
-        if not enriched_ok:
-            if enriched_existing:
-                # Partial leftover from an interrupted run — clear and redo.
-                self._enriched.delete_many({"metadata.page_hash": page_hash})
-            self._enriched.insert_many(
+            # Partial leftover from an interrupted run — clear and redo.
+            if existing:
+                handle.delete_many(page_filter)
+
+            # Only now do we pay for embeddings, and only for this collection's
+            # chunks. The order of embeddings matches the order of `chunks`.
+            embeddings = self._embed_texts(chunks)
+            handle.insert_many(
                 [
-                    {
-                        # Deterministic _id: same page+chunk always maps to the same
-                        # document, which is what makes re-runs idempotent.
-                        "_id": f"{page_hash}:{idx}",
-                        "text": chunk_text,
-                        "embedding": list(embedding),
-                        # The metadata block is the whole point of the "enriched"
-                        # collection: it lets retrieval filter/cite by source, page,
-                        # and the parsed DO issue fields.
-                        "metadata": {
-                            "file_name": file_name,
-                            "file_path": file_path,
-                            "file_md5": file_md5,
-                            "page": page_number,
-                            "total_pages": total_pages,
-                            "page_hash": page_hash,
-                            "chunk_index": idx,
-                            "page_chunk_count": expected,
-                            "do_issue_number": do_issue.issue_number,
-                            "do_year": do_issue.year,
-                            "edition_date": do_issue.edition_date,
-                            "is_extra": do_issue.is_extra,
-                            "issue_source": do_issue.source,
-                        },
-                    }
+                    self._build_document(
+                        enriched=entry["enriched"],
+                        page_hash=page_hash,
+                        idx=idx,
+                        chunk_text=chunk_text,
+                        embedding=embedding,
+                        file_name=file_name,
+                        file_path=file_path,
+                        file_md5=file_md5,
+                        page_number=page_number,
+                        total_pages=total_pages,
+                        expected=expected,
+                        do_issue=do_issue,
+                    )
                     for idx, (chunk_text, embedding) in enumerate(
                         zip(chunks, embeddings)
                     )
                 ]
             )
 
-        # --- Write to the PLAIN collection (text + embedding only) ---------------
-        if not plain_ok:
-            if plain_existing:
-                self._plain.delete_many(
-                    {"_id": {"$regex": f"^{re.escape(page_hash)}:"}}
-                )
-            self._plain.insert_many(
-                [
-                    {
-                        # Same deterministic _id as the enriched doc, so the two
-                        # collections stay perfectly aligned per chunk.
-                        "_id": f"{page_hash}:{idx}",
-                        "text": chunk_text,
-                        "embedding": list(embedding),
-                    }
-                    for idx, (chunk_text, embedding) in enumerate(
-                        zip(chunks, embeddings)
-                    )
-                ]
-            )
+    @staticmethod
+    def _build_document(
+        enriched: bool,
+        page_hash: str,
+        idx: int,
+        chunk_text: str,
+        embedding: list[float],
+        file_name: str,
+        file_path: str,
+        file_md5: str,
+        page_number: int,
+        total_pages: int,
+        expected: int,
+        do_issue: DoIssue,
+    ) -> dict:
+        """Shape one stored document for either collection.
+
+        Both collections share the deterministic ``_id`` (``f"{page_hash}:{idx}"``)
+        so per-page idempotency and stale cleanup stay simple. Only the enriched
+        collection carries the rich ``metadata`` block; the plain one stores just
+        ``{_id, text, embedding}``.
+        """
+        document = {
+            # Deterministic _id: same page+chunk always maps to the same document
+            # (within a collection), which is what makes re-runs idempotent.
+            "_id": f"{page_hash}:{idx}",
+            "text": chunk_text,
+            "embedding": list(embedding),
+        }
+        if enriched:
+            # The metadata block is the whole point of the "enriched" collection:
+            # it lets retrieval filter/cite by source, page, and parsed DO fields.
+            document["metadata"] = {
+                "file_name": file_name,
+                "file_path": file_path,
+                "file_md5": file_md5,
+                "page": page_number,
+                "total_pages": total_pages,
+                "page_hash": page_hash,
+                "chunk_index": idx,
+                "page_chunk_count": expected,
+                "do_issue_number": do_issue.issue_number,
+                "do_year": do_issue.year,
+                "edition_date": do_issue.edition_date,
+                "is_extra": do_issue.is_extra,
+                "issue_source": do_issue.source,
+            }
+        return document
 
     def _is_file_complete(self, file_md5: str, total_pages: int) -> bool:
         """Fast path: every page of this file version is present in BOTH collections.
 
-        The enriched collection carries page metadata, so its completeness is
-        checked directly. The plain collection has no metadata, so it is verified
-        by mirroring the enriched collection's per-page chunk counts via the
-        shared deterministic ``_id`` (``f"{page_hash}:{idx}"``).
+        The collections now use different chunking, so the plain collection can no
+        longer be verified by mirroring the enriched per-page chunk counts. Each
+        collection is checked independently instead:
+
+        - enriched: it has metadata, so we confirm a document exists for every
+          page number of this file version;
+        - plain: it has no metadata, so we use the shared ``page_hash`` set
+          (discovered via the enriched collection) and confirm every page has at
+          least one plain document. Exact per-page chunk counts are still enforced
+          by ``_process_page``; this fast path only avoids reopening files that are
+          clearly already done.
         """
         # First, cheap check: does the enriched collection already have a document
         # for every page number of this file version?
@@ -365,17 +424,16 @@ class PdfEmbeddingService:
         if len(enriched_pages) < total_pages:
             return False
 
-        # Enriched looks complete. Now confirm the plain collection mirrors it,
-        # page by page, by comparing chunk counts for each page_hash.
+        # Enriched looks complete. Now confirm the plain collection has at least one
+        # document for every page (keyed by the chunking-independent page_hash).
         page_hashes = self._enriched.distinct(
             "metadata.page_hash", {"metadata.file_md5": file_md5}
         )
         for page_hash in page_hashes:
-            expected = self._enriched.count_documents({"metadata.page_hash": page_hash})
             plain_count = self._plain.count_documents(
                 {"_id": {"$regex": f"^{re.escape(page_hash)}:"}}
             )
-            if plain_count != expected:
+            if plain_count == 0:
                 return False
         return True
 
@@ -387,14 +445,14 @@ class PdfEmbeddingService:
             "metadata.file_path": file_path,
             "metadata.file_md5": {"$ne": file_md5},
         }
-        # The plain collection has no metadata, but shares the enriched _ids, so
-        # collect the stale ids from the enriched collection and remove them from
-        # both.
-        stale_ids = [
-            doc["_id"] for doc in self._enriched.find(stale_filter, {"_id": 1})
-        ]
-        if stale_ids:
-            self._plain.delete_many({"_id": {"$in": stale_ids}})
+        # The plain collection has no metadata and no longer shares the enriched
+        # chunk counts, so its _ids can't be derived from the enriched ones. We
+        # instead resolve the stale page_hashes from the enriched collection (the
+        # one chunking-independent key both collections share via the _id prefix)
+        # and delete every plain document under those prefixes.
+        stale_page_hashes = self._enriched.distinct("metadata.page_hash", stale_filter)
+        for page_hash in stale_page_hashes:
+            self._plain.delete_many({"_id": {"$regex": f"^{re.escape(page_hash)}:"}})
         self._enriched.delete_many(stale_filter)
 
     @staticmethod
@@ -425,11 +483,11 @@ class PdfEmbeddingService:
         return embeddings
 
     def _ensure_collections(self) -> None:
-        """Create the two collections if they don't exist yet (no-op otherwise)."""
+        """Create the configured collections if they don't exist yet (else no-op)."""
         existing = set(self._db.list_collection_names())
-        for name in (_COLLECTION_PLAIN, _COLLECTION_ENRICHED):
-            if name not in existing:
-                self._db.create_collection(name)
+        for cfg in _COLLECTION_CONFIGS.values():
+            if cfg["name"] not in existing:
+                self._db.create_collection(cfg["name"])
 
     def _ensure_indexes(self) -> None:
         """Create the btree + vector indexes needed for lookups and search."""
@@ -440,10 +498,19 @@ class PdfEmbeddingService:
         self._enriched.create_index([("metadata.file_path", ASCENDING)])
         self._enriched.create_index([("metadata.page", ASCENDING)])
 
-        # Both collections need the vector index so they can be queried by
-        # semantic similarity at retrieval time.
-        for collection in (self._plain, self._enriched):
-            self._ensure_vector_index(collection)
+        # Every configured collection needs the vector index so it can be queried
+        # by semantic similarity at retrieval time. Each call mostly waits on Atlas
+        # to build the index asynchronously, so we run them on a small thread pool
+        # to build both collections' indexes concurrently instead of back to back.
+        handles = [entry["handle"] for entry in self._collections.values()]
+        with ThreadPoolExecutor(max_workers=len(handles)) as executor:
+            futures = [
+                executor.submit(self._ensure_vector_index, handle) for handle in handles
+            ]
+            # Re-raise the first failure (e.g. a build timeout) after all the
+            # concurrent waits have settled.
+            for future in as_completed(futures):
+                future.result()
 
     def _ensure_vector_index(self, collection: Collection) -> None:
         """Create the Atlas Vector Search index on a collection if it's missing."""
